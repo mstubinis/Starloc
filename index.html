@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Starloc</title>
+    <style>
+    html,head,body{margin:0;outline:0;border:0;padding:0;top:0;left:0;position:absolute;z-index:1;}
+    </style>
+    <script src="../deps/gl-matrix.js"> </script>
+    <script src="../deps/webgl-utils.js"></script>
+    <script src="../deps/OBJLoader.js"></script>
+    <script src="../deps/ammo.js"></script>
+    
+    <script src="core/Engine_ResourceManager.js"></script>
+    <script src="core/Engine_RenderManager.js"></script>
+    <script src="core/Engine_ObjectManager.js"></script>
+    <script src="core/Engine_EventManager.js"></script>
+    <script src="core/Engine_PhysicsManager.js"></script>
+    <script src="core/Engine_Core.js"></script>
+    
+    <script src="core/scene.js"></script>
+    <script src="core/shader.js"></script>
+    <script src="core/mesh.js"></script>
+    <script src="core/texture.js"></script>
+    <script src="core/material.js"></script>
+    <script src="core/camera.js"></script>
+    <script src="core/object.js"></script>
+    <script src="core/skybox.js"></script>
+    <script src="core/light.js"></script>
+    <script src="core/instance.js"></script>
+    
+    <script src="game.js"></script>
+    <script src="database.js"></script>
+     
+    <script id="vshader" type="x-shader/x-vertex">
+        attribute vec3 position;
+        attribute vec2 uv;
+        attribute vec3 normal;
+        attribute vec3 binormal;
+        attribute vec3 tangent;
+
+        uniform mat4 M;
+        uniform mat4 V;
+        uniform mat4 P;
+        uniform mat4 normalMatrix;
+        
+        varying vec2 UV;
+        varying vec4 Part1; //Normals and Binormal.x
+        varying vec4 Part2; //Binormal.y Binormal.z Tangent.x Tangent.y
+        varying vec4 Part3; //Tangent.z World Position
+        void main(void){
+            vec3 Normal = normalize(normalMatrix * vec4(normal,1.0)).xyz;
+            vec3 Binormal = normalize(normalMatrix * vec4(binormal,1.0)).xyz;
+            vec3 Tangent = normalize(normalMatrix * vec4(tangent,1.0)).xyz;
+            
+            vec3 WorldPosition = (M * vec4(position,1.0)).xyz;
+
+            UV = uv;
+            Part1 = vec4(Normal.xyz,Binormal.x);
+            Part2 = vec4(Binormal.y,Binormal.z,Tangent.x,Tangent.y);
+            Part3 = vec4(Tangent.z,WorldPosition.xyz);
+
+            gl_Position =  (P * V * M) * vec4(position,1.0);
+        }
+    </script>
+    <script id="fshader" type="x-shader/x-fragment">
+        precision mediump float;
+        precision mediump int;
+
+        uniform sampler2D diffuseMap;
+        uniform sampler2D glowMap;
+        uniform sampler2D normalMap;
+
+        const int MAX_LIGHTS = 8;
+        uniform int numLights;
+        struct Light {
+            vec3 LightProperties;//x = DiffusePower | y = SpecularPower | z = LightW
+            vec3 LightColor;
+            vec3 LightPosition;
+            vec3 LightAttenuation;
+        };
+        uniform Light lights[MAX_LIGHTS];
+
+        uniform vec3 SceneAmbient;
+        
+        uniform int MaterialShadeless;
+        uniform vec4 MaterialColor;       //rgb is color. a is transparency
+        uniform vec4 MaterialSpecularity; //rgb is color. a is shininess
+        
+        uniform vec3 CameraPosition;
+        uniform vec4 ObjectColor;
+        
+        varying vec2 UV;
+        varying vec4 Part1; //Normals and Binormal.x
+        varying vec4 Part2; //Binormal.y Binormal.z Tangent.x Tangent.y
+        varying vec4 Part3; //Tangent.z World Position
+        vec3 CalcBumpedNormal(vec3 unpackedNormals){
+            vec3 normalMapTexture = (texture2D(normalMap, UV).xyz) * 2.0 - 1.0; 
+            vec3 unpackedBinormals = vec3(Part1.w,Part2.x,Part2.y);
+            vec3 unpackedTangents = vec3(Part2.z,Part2.w,Part3.x);
+            mat3 TBN = mat3(unpackedTangents, unpackedBinormals, unpackedNormals);
+            return normalize(TBN * normalMapTexture);
+        }
+        vec3 CalcLightInternal(vec3 SurfaceToLight,Light light,vec3 SurfaceNormal,vec3 SurfacePosition){
+            vec3 LightingFinal = SceneAmbient;
+            float nDotL = max(0.0, dot(SurfaceNormal, SurfaceToLight));
+            if(nDotL > 0.0){
+                vec3 DiffuseColor = nDotL * (MaterialColor.rgb * light.LightProperties.x);
+                vec3 ViewVector = -normalize(SurfacePosition - CameraPosition);
+                // this is blinn phong
+                vec3 HalfVector = normalize(SurfaceToLight + ViewVector);
+                float SpecularAngle = max(dot(HalfVector, SurfaceNormal), 0.0);
+                SpecularAngle = pow(SpecularAngle, MaterialSpecularity.w);
+                vec3 SpecularColor = MaterialSpecularity.rgb * light.LightProperties.y * SpecularAngle;
+                LightingFinal += (DiffuseColor + SpecularColor);
+            }
+            return LightingFinal;
+        }
+        void main(void){
+            vec4 diffuseTexture = texture2D(diffuseMap,UV);
+            if(MaterialShadeless == int(1.0)){
+                gl_FragColor.rgb = (diffuseTexture.rgb * ObjectColor.rgb);
+                gl_FragColor.a = MaterialColor.a * (diffuseTexture.a * ObjectColor.a);
+                return;
+            }
+            
+            vec3 glowTexture = vec3(texture2D(glowMap,UV).r);
+            vec3 SurfacePosition = Part3.yzw;
+
+            vec3 SurfaceNormal = normalize(CalcBumpedNormal(Part1.xyz));
+
+            vec3 lighting = SceneAmbient;
+            for(int i = 0; i < MAX_LIGHTS; ++i){ // stupid loop index cannot be compared with a non constant uniform... idk why...
+                if(i < numLights){
+                    Light light = lights[i];
+                    vec3 individualLighting = vec3(0.0);
+                    if(light.LightProperties.z == 0.0) {//directional light
+                        individualLighting = CalcLightInternal(normalize(light.LightPosition),light,SurfaceNormal,SurfacePosition);
+                    } 
+                    else {//point light
+                        vec3 SurfaceToLight = normalize(light.LightPosition - SurfacePosition);
+                        individualLighting = CalcLightInternal(SurfaceToLight,light,SurfaceNormal,SurfacePosition);
+                        float D = length(light.LightPosition - SurfacePosition);
+                        float Att = max(1.0 , light.LightAttenuation.x + (light.LightAttenuation.y * D) + (light.LightAttenuation.z * D * D));
+                        
+                        individualLighting /= Att;
+                        //cone restrictions (affects attenuation)
+                        //float lightToSurfaceAngle = degrees(acos(dot(-SurfaceToLight, normalize(light.coneDirection))));
+                        //if(lightToSurfaceAngle > light.coneAngle){
+                            //Att = 0.0;
+                            //individualLighting = vec3(0.0);
+                        //}
+                    }
+                    lighting += individualLighting;
+                }
+            }
+            gl_FragColor.rgb = max(lighting,glowTexture) * (diffuseTexture.rgb * ObjectColor.rgb);
+            gl_FragColor.a = MaterialColor.a * (diffuseTexture.a * ObjectColor.a);
+        }
+    </script>   
+</head>
+<body style = "background-color:black;">
+    <script>
+    function getParamValue(paramName){
+        var url = window.location.search.substring(1);
+        var array = url.split('&');
+        for (var i = 0; i < array.length; i++){
+            var pArr = array[i].split('=');
+            if (pArr[0] == paramName) 
+                return pArr[1];
+        }
+    }
+    function init(){
+        var w = Math.max(document.documentElement.clientWidth, window.innerWidth || 0.0);
+        var h = Math.max(document.documentElement.clientHeight, window.innerHeight || 0.0);
+        Engine.init( w,h );
+    }
+    window.onload = init;
+    </script>
+</body>
+</html>
